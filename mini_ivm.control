@@ -1,0 +1,4 @@
+comment = 'Improved mini incremental materialized view'
+default_version = '1.0'
+relocatable = true
+module_pathname = '$libdir/mini_ivm'
