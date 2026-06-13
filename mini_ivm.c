@@ -281,7 +281,7 @@ create_mini_ivm(PG_FUNCTION_ARGS)
     SPI_connect();
 
     /* Extract elements from grouping columns text array */
-    deconstruct_array(group_cols_arr, TEXTOID, -1, false, typalign_of(TEXTOID),
+    deconstruct_array(group_cols_arr, TEXTOID, -1, false, TYPALIGN_INT,
                       &group_cols_datums, &group_cols_nulls, &num_cols);
 
     if (num_cols <= 0)
