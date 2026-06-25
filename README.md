@@ -1,116 +1,96 @@
-# mini_ivm: Generic Incremental Materialized View builder
+# mini_ivm: Incremental Materialized View Maintenance for PostgreSQL
 
-`mini_ivm` is a lightweight **PostgreSQL C Extension** designed to dynamically construct and incrementally maintain materialized summary tables (views) from any base table. 
+`mini_ivm` is a lightweight **PostgreSQL C Extension** that incrementally maintains materialized views using database triggers. Instead of requiring a full `REFRESH MATERIALIZED VIEW`, it updates the underlying aggregation table on every `INSERT`, `UPDATE`, or `DELETE` on the source table.
 
-Unlike traditional PostgreSQL materialized views that require a full table rewrite (`REFRESH MATERIALIZED VIEW`), `mini_ivm` updates row counts incrementally on modification (`INSERT`, `UPDATE`, `DELETE`) using row-level database triggers.
+Supports **SUM**, **COUNT**, **MIN**, and **MAX** aggregates with automatic AST-based parsing of the materialized view definition.
 
 ---
 
 ## Features
 
-- **Fully Generic:** Works with any source table, dynamic destination (view) table, and custom lists of text-based grouping columns.
-- **Optimized UPDATE Handling:** Trigger logic ignores column updates that don't affect the grouping columns (e.g., updating a `price` or `amount` column does not execute redundant database writes).
-- **Targeted Garbage Collection:** Rows with `total_count <= 0` are deleted target-wise (using indexed parameters) rather than querying a slow, table-wide scan delete.
-- **Standard Extension Testing:** Includes standard `pg_regress` integration tests.
+- **SQL-based setup:** Create a standard `MATERIALIZED VIEW`, then call `create_incremental_mv('view_name')` — the extension parses the view definition automatically.
+- **SUM, COUNT, MIN, MAX:** Full incremental maintenance for all four aggregate types.
+- **Smart UPDATE handling:** Grouping column changes trigger DELETE+INSERT; value-only changes update aggregates in-place; no-op changes are skipped.
+- **MIN/MAX recomputation:** When the min or max row is deleted, the extension automatically recomputes from the source data.
+- **Garbage collection:** Zero-count rows are pruned automatically.
 
 ---
 
 ## Installation & Build
 
 ### Prerequisites
-Make sure you have the PostgreSQL development headers installed (e.g., `postgresql-server-dev-16` or equivalent).
+PostgreSQL development headers (e.g., `postgresql-server-dev-16` or equivalent).
 
-### 1. Compile the extension
-Run `make` to compile the C source code:
+### 1. Compile
 ```bash
 make
 ```
 
-### 2. Install to PostgreSQL library directory
-Run `make install` (requires sudo permissions to copy files into your PostgreSQL path):
+### 2. Install
 ```bash
 sudo make install
 ```
 
----
-
-## How to Use
-
-### 1. Enable the extension
-In your PostgreSQL client:
+### 3. Enable in database
 ```sql
 CREATE EXTENSION mini_ivm;
 ```
 
-### 2. Initialize an Incremental Materialized View
-Invoke the `create_mini_ivm` setup function:
-```sql
-SELECT create_mini_ivm(
-    'source_table_name', 
-    'materialized_view_name', 
-    ARRAY['group_column_1', 'group_column_2']
-);
-```
-
-#### What happens behind the scenes?
-- A new table named `materialized_view_name` is created containing your grouping columns (with a composite `PRIMARY KEY`) and a `total_count` column.
-- An `AFTER INSERT OR UPDATE OR DELETE` row-level trigger is attached to your source table, invoking the C-backed `mini_ivm_maintain` function to update counts on mutations.
-
 ---
 
-## Example Usage
+## Usage
 
-Let's assume you have a base table named `orders`:
+### 1. Create a base table and a standard materialized view
 ```sql
 CREATE TABLE orders (
-    product TEXT,
+    product  TEXT,
     category TEXT,
-    location TEXT,
-    amount NUMERIC
+    amount   NUMERIC
 );
 
--- Set up dynamic count tracking for product + category
-SELECT create_mini_ivm('orders', 'mv_product_category', ARRAY['product', 'category']);
+CREATE MATERIALIZED VIEW order_summary AS
+SELECT
+    product,
+    category,
+    SUM(amount) AS total_amount,
+    COUNT(*)    AS num_orders,
+    MIN(amount) AS min_amount,
+    MAX(amount) AS max_amount
+FROM orders
+GROUP BY product, category;
 ```
 
-### Insert Operations
-Inserting rows into `orders` automatically populates counts:
+### 2. Enable incremental maintenance
 ```sql
-INSERT INTO orders VALUES ('Laptop', 'Electronics', 'USA', 1000);
-INSERT INTO orders VALUES ('Laptop', 'Electronics', 'USA', 1200);
-
-SELECT * FROM mv_product_category;
--- Outputs:
---  product |  category   | total_count 
--- ---------+-------------+-------------
---  Laptop  | Electronics |           2
+SELECT create_incremental_mv('order_summary');
 ```
 
-### Update Operations
-Updating non-group columns (e.g., `amount`) triggers no writes on `mv_product_category`:
+This creates an internal tracking table (`imv_order_summary`), backfills it with current data, and attaches triggers to the source table.
+
+### 3. Use normally — the view stays up to date
 ```sql
-UPDATE orders SET amount = 1100 WHERE amount = 1000; -- No delta recalculations!
+INSERT INTO orders VALUES ('Laptop', 'Electronics', 1000);
+INSERT INTO orders VALUES ('Laptop', 'Electronics', 1200);
+
+SELECT * FROM imv_order_summary;
+--  product |  category   | total_amount | num_orders | min_amount | max_amount
+-- ---------+-------------+--------------+------------+------------+------------
+--  Laptop  | Electronics |         2200 |          2 |       1000 |       1200
 ```
 
-Updating grouping columns correctly relocates the summary:
+### 4. Drop incremental tracking
 ```sql
-UPDATE orders SET category = 'Office' WHERE amount = 1100;
-
-SELECT * FROM mv_product_category;
--- Outputs:
---  product |  category   | total_count 
--- ---------+-------------+-------------
---  Laptop  | Electronics |           1
---  Laptop  | Office      |           1
+SELECT drop_incremental_mv('order_summary');
 ```
+
+This removes the trigger and internal tracking table. The original materialized view is preserved.
 
 ---
 
-## Running the Tests
-This project includes a regression suite integrated with `pg_regress`. 
+## Running Tests
 
-Once the extension is installed, run:
 ```bash
 make installcheck
 ```
-The test inputs are located in [sql/mini_ivm_test.sql](sql/mini_ivm_test.sql) and matched against the expected outputs in [expected/mini_ivm_test.out](expected/mini_ivm_test.out).
+
+Test inputs: `sql/mini_ivm_test.sql` · Expected output: `expected/mini_ivm_test.out`

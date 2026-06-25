@@ -28,7 +28,7 @@ Currently, `mini_ivm` uses `FOR EACH ROW` triggers. If a user runs `UPDATE order
 - Transition Tables (`REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table`).
 
 **Action Items for `mini_ivm`:**
-- [ ] **Switch to Transition Tables:** Modify `create_mini_ivm` to create a statement-level trigger.
+- [ ] **Switch to Transition Tables:** Modify `create_incremental_mv` to create a statement-level trigger.
 - [ ] **Batch Processing:** Inside the C function, instead of reading one `HeapTuple`, execute a query against the transition tables to aggregate all changes in the statement into a single internal "delta" set.
 - [ ] **Batch Upsert:** Apply the entire delta set to the materialized view in a single SQL operation (e.g., `INSERT ... ON CONFLICT ...`) rather than looping.
 
@@ -60,7 +60,7 @@ Real IVM extensions don't ask users to pass array columns to a setup function. U
 
 **Action Items for `mini_ivm`:**
 - [ ] **Hook `ProcessUtility`:** Intercept SQL commands. Look for a custom syntax or intercept standard view creation.
-- [ ] **Parse the Query Tree:** When a user creates a view, analyze the `SELECT` query tree to automatically determine the base table(s), the grouping columns, and the aggregates used.
+- [x] **Parse the Query Tree:** When a user creates a view, analyze the `SELECT` query tree to automatically determine the base table(s), the grouping columns, and the aggregates used.
 - [ ] **Store Metadata:** Create a catalog table (e.g., `mini_ivm_views`) to store this parsed metadata so the triggers know exactly how to maintain the view.
 
 ---
@@ -75,9 +75,9 @@ Currently, `mini_ivm` only counts. A real IVM needs `SUM`, `AVG`, `MIN`, `MAX`, 
 - Delta rules for Joins (e.g., `Δ(A ⨝ B) = (ΔA ⨝ B) ∪ (A ⨝ ΔB) ∪ (ΔA ⨝ ΔB)`).
 
 **Action Items for `mini_ivm`:**
-- [ ] **Implement `SUM`:** Add support for tracking `SUM(column)`.
+- [x] **Implement `SUM`:** Add support for tracking `SUM(column)`.
 - [ ] **Implement `AVG`:** Add support for `AVG` by tracking both `SUM` and `COUNT` internally.
-- [ ] **Single-table `MIN`/`MAX`:** Implement algorithms to maintain extrema efficiently.
+- [x] **Single-table `MIN`/`MAX`:** Implement algorithms to maintain extrema efficiently.
 - [ ] **Multi-table Joins:** Update the AST parser to understand `JOIN`s. Create triggers on *all* underlying base tables. When Table A changes, use the transition tables of A joined against the current state of Table B to calculate the delta for the view.
 
 ---
