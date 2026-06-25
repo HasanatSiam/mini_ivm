@@ -3,8 +3,6 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "utils/builtins.h"
-#include "utils/array.h"
-#include "utils/lsyscache.h"
 #include "catalog/pg_type.h"
 #include "parser/parser.h"
 #include "nodes/parsenodes.h"
@@ -896,13 +894,6 @@ drop_incremental_mv(PG_FUNCTION_ARGS)
     char *mv_schema = NULL;
 
     SPI_connect();
-
-    /* Extract elements from grouping columns text array */
-    deconstruct_array(group_cols_arr, TEXTOID, -1, false, TYPALIGN_INT,
-                      &group_cols_datums, &group_cols_nulls, &num_cols);
-
-    if (num_cols <= 0)
-        elog(ERROR, "At least one grouping column must be specified");
 
     /* 1. Create dynamic IMMV table */
     initStringInfo(&query);
