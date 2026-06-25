@@ -1,113 +1,76 @@
--- test/sql/mini_ivm_test.sql
--- Setup extension
-CREATE EXTENSION IF NOT EXISTS mini_ivm;
--- Create source table
-CREATE TABLE test_orders (
-    product TEXT,
-    category TEXT,
-    location TEXT,
-    amount NUMERIC
-);
--- Initialize generic IVM with 2 group columns
-SELECT create_mini_ivm('test_orders', 'mv_product_category', ARRAY['product', 'category']);
- create_mini_ivm 
------------------
+SET
+SET
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE TABLE
+SELECT 0
+ create_incremental_mv 
+-----------------------
  
 (1 row)
 
--- Initialize a second IVM on the same source table with 3 group columns
-SELECT create_mini_ivm('test_orders', 'mv_full_summary', ARRAY['product', 'category', 'location']);
- create_mini_ivm 
------------------
+ product | category | total_amount | num_orders | min_amount | max_amount 
+---------+----------+--------------+------------+------------+------------
+(0 rows)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+  test  | product |  category   | total_amount | num_orders | min_amount | max_amount 
+--------+---------+-------------+--------------+------------+------------+------------
+ INSERT | Laptop  | Electronics |         2200 |          2 |       1000 |       1200
+ INSERT | Phone   | Electronics |          800 |          1 |        800 |        800
+(2 rows)
+
+UPDATE 1
+    test    | product |  category   | total_amount | num_orders | min_amount | max_amount 
+------------+---------+-------------+--------------+------------+------------+------------
+ UPDATE_VAL | Laptop  | Electronics |         2700 |          2 |       1200 |       1500
+ UPDATE_VAL | Phone   | Electronics |          800 |          1 |        800 |        800
+(2 rows)
+
+UPDATE 1
+     test     | product |  category   | total_amount | num_orders | min_amount | max_amount 
+--------------+---------+-------------+--------------+------------+------------+------------
+ UPDATE_GROUP | Laptop  | Electronics |         1500 |          1 |       1500 |       1500
+ UPDATE_GROUP | Laptop  | Office      |         1200 |          1 |       1200 |       1200
+ UPDATE_GROUP | Phone   | Electronics |          800 |          1 |        800 |        800
+(3 rows)
+
+DELETE 1
+  test  | product |  category   | total_amount | num_orders | min_amount | max_amount 
+--------+---------+-------------+--------------+------------+------------+------------
+ DELETE | Laptop  | Electronics |         1500 |          1 |       1500 |       1500
+ DELETE | Laptop  | Office      |         1200 |          1 |       1200 |       1200
+(2 rows)
+
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+     test     | product |  category   | total_amount | num_orders | min_amount | max_amount 
+--------------+---------+-------------+--------------+------------+------------+------------
+ MULTI_INSERT | Laptop  | Electronics |         1500 |          1 |       1500 |       1500
+ MULTI_INSERT | Laptop  | Office      |         2100 |          4 |        100 |       1200
+(2 rows)
+
+DELETE 1
+    test    | product |  category   | total_amount | num_orders | min_amount | max_amount 
+------------+---------+-------------+--------------+------------+------------+------------
+ DELETE_MIN | Laptop  | Electronics |         1500 |          1 |       1500 |       1500
+ DELETE_MIN | Laptop  | Office      |         2000 |          3 |        300 |       1200
+(2 rows)
+
+DELETE 1
+    test    | product | category | total_amount | num_orders | min_amount | max_amount 
+------------+---------+----------+--------------+------------+------------+------------
+ DELETE_MAX | Laptop  | Office   |         2000 |          3 |        300 |       1200
+(1 row)
+
+ drop_incremental_mv 
+---------------------
  
 (1 row)
 
--- Test 1: Single Inserts
-INSERT INTO test_orders VALUES ('Laptop', 'Electronics', 'USA', 1000);
-INSERT INTO test_orders VALUES ('Laptop', 'Electronics', 'USA', 1200);
-INSERT INTO test_orders VALUES ('Shirt', 'Apparel', 'UK', 25);
-INSERT INTO test_orders VALUES ('Shirt', 'Apparel', 'USA', 25);
-SELECT 'Table: mv_product_category' AS test_1_mv1;
-        test_1_mv1         
----------------------------
- Table: mv_product_category
-(1 row)
-
-SELECT * FROM mv_product_category ORDER BY product, category;
- product |  category   | total_count 
----------+-------------+-------------
- Laptop  | Electronics |           2
- Shirt   | Apparel     |           2
-(2 rows)
-
-SELECT 'Table: mv_full_summary' AS test_1_mv2;
-       test_1_mv2       
-------------------------
- Table: mv_full_summary
-(1 row)
-
-SELECT * FROM mv_full_summary ORDER BY product, category, location;
- product |  category   | location | total_count 
----------+-------------+----------+-------------
- Laptop  | Electronics | USA      |           2
- Shirt   | Apparel     | UK       |           1
- Shirt   | Apparel     | USA      |           1
-(3 rows)
-
--- Test 2: Updates (Not changing group columns)
-UPDATE test_orders SET amount = 1100 WHERE product = 'Laptop' AND amount = 1000;
-SELECT 'Table: mv_product_category (after non-group update)' AS test_2_mv1;
-                     test_2_mv1                      
------------------------------------------------------
- Table: mv_product_category (after non-group update)
-(1 row)
-
-SELECT * FROM mv_product_category ORDER BY product, category;
- product |  category   | total_count 
----------+-------------+-------------
- Laptop  | Electronics |           2
- Shirt   | Apparel     |           2
-(2 rows)
-
--- Test 3: Updates (Changing group columns)
-UPDATE test_orders SET category = 'Office' WHERE product = 'Laptop' AND amount = 1100;
-SELECT 'Table: mv_product_category (after group update)' AS test_3_mv1;
-                    test_3_mv1                    
---------------------------------------------------
- Table: mv_product_category (after group update)
-(1 row)
-
-SELECT * FROM mv_product_category ORDER BY product, category;
- product |  category   | total_count 
----------+-------------+-------------
- Laptop  | Electronics |           1
- Laptop  | Office      |           1
- Shirt   | Apparel     |           2
-(3 rows)
-
--- Test 4: Deletes
-DELETE FROM test_orders WHERE product = 'Shirt';
-SELECT 'Table: mv_product_category (after deletes)' AS test_4_mv1;
-                 test_4_mv1                 
---------------------------------------------
- Table: mv_product_category (after deletes)
-(1 row)
-
-SELECT * FROM mv_product_category ORDER BY product, category;
- product |  category   | total_count 
----------+-------------+-------------
- Laptop  | Electronics |           1
- Laptop  | Office      |           1
-(2 rows)
-
-SELECT 'Table: mv_full_summary (after deletes)' AS test_4_mv2;
-               test_4_mv2               
-----------------------------------------
- Table: mv_full_summary (after deletes)
-(1 row)
-
-SELECT * FROM mv_full_summary ORDER BY product, category, location;
- product |  category   | location | total_count 
----------+-------------+----------+-------------
- Laptop  | Electronics | USA      |           2
-(1 row)
+DROP MATERIALIZED VIEW
+DROP TABLE

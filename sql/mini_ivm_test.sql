@@ -1,49 +1,79 @@
--- test/sql/mini_ivm_test.sql
--- Setup extension
-CREATE EXTENSION IF NOT EXISTS mini_ivm;
+-- mini_ivm regression test
 
--- Create source table
-CREATE TABLE test_orders (
+SET client_min_messages TO warning;
+SET dynamic_library_path TO '/tmp';
+
+CREATE OR REPLACE FUNCTION mini_ivm_maintain()
+RETURNS trigger
+AS '/tmp/mini_ivm', 'mini_ivm_maintain'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION create_incremental_mv(mv_name text)
+RETURNS void
+AS '/tmp/mini_ivm', 'create_incremental_mv'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION drop_incremental_mv(mv_name text)
+RETURNS void
+AS '/tmp/mini_ivm', 'drop_incremental_mv'
+LANGUAGE C;
+
+-- Create base table
+CREATE TABLE orders (
     product TEXT,
     category TEXT,
-    location TEXT,
     amount NUMERIC
 );
 
--- Initialize generic IVM with 2 group columns
-SELECT create_mini_ivm('test_orders', 'mv_product_category', ARRAY['product', 'category']);
+-- Create materialized view with all 4 aggregate types
+CREATE MATERIALIZED VIEW order_summary AS
+SELECT product, category,
+       SUM(amount) AS total_amount,
+       COUNT(*) AS num_orders,
+       MIN(amount) AS min_amount,
+       MAX(amount) AS max_amount
+FROM orders
+GROUP BY product, category;
 
--- Initialize a second IVM on the same source table with 3 group columns
-SELECT create_mini_ivm('test_orders', 'mv_full_summary', ARRAY['product', 'category', 'location']);
+-- Create the incremental materialized view
+SELECT create_incremental_mv('order_summary');
 
--- Test 1: Single Inserts
-INSERT INTO test_orders VALUES ('Laptop', 'Electronics', 'USA', 1000);
-INSERT INTO test_orders VALUES ('Laptop', 'Electronics', 'USA', 1200);
-INSERT INTO test_orders VALUES ('Shirt', 'Apparel', 'UK', 25);
-INSERT INTO test_orders VALUES ('Shirt', 'Apparel', 'USA', 25);
+-- Check initial state (empty)
+SELECT * FROM imv_order_summary ORDER BY product, category;
 
-SELECT 'Table: mv_product_category' AS test_1_mv1;
-SELECT * FROM mv_product_category ORDER BY product, category;
+-- Test INSERT
+INSERT INTO orders VALUES ('Laptop', 'Electronics', 1000);
+INSERT INTO orders VALUES ('Laptop', 'Electronics', 1200);
+INSERT INTO orders VALUES ('Phone', 'Electronics', 800);
+SELECT 'INSERT' as test, * FROM imv_order_summary ORDER BY product, category;
 
-SELECT 'Table: mv_full_summary' AS test_1_mv2;
-SELECT * FROM mv_full_summary ORDER BY product, category, location;
+-- Test UPDATE non-group column (old value was the MIN, must recompute)
+UPDATE orders SET amount = 1500 WHERE amount = 1000;
+SELECT 'UPDATE_VAL' as test, * FROM imv_order_summary ORDER BY product, category;
 
--- Test 2: Updates (Not changing group columns)
-UPDATE test_orders SET amount = 1100 WHERE product = 'Laptop' AND amount = 1000;
+-- Test UPDATE group column (category change, DELETE+INSERT)
+UPDATE orders SET category = 'Office' WHERE amount = 1200;
+SELECT 'UPDATE_GROUP' as test, * FROM imv_order_summary ORDER BY product, category;
 
-SELECT 'Table: mv_product_category (after non-group update)' AS test_2_mv1;
-SELECT * FROM mv_product_category ORDER BY product, category;
+-- Test DELETE
+DELETE FROM orders WHERE amount = 800;
+SELECT 'DELETE' as test, * FROM imv_order_summary ORDER BY product, category;
 
--- Test 3: Updates (Changing group columns)
-UPDATE test_orders SET category = 'Office' WHERE product = 'Laptop' AND amount = 1100;
+-- Test multiple inserts into same group
+INSERT INTO orders VALUES ('Laptop', 'Office', 100);
+INSERT INTO orders VALUES ('Laptop', 'Office', 500);
+INSERT INTO orders VALUES ('Laptop', 'Office', 300);
+SELECT 'MULTI_INSERT' as test, * FROM imv_order_summary ORDER BY product, category;
 
-SELECT 'Table: mv_product_category (after group update)' AS test_3_mv1;
-SELECT * FROM mv_product_category ORDER BY product, category;
+-- Test DELETE of MIN (forces recompute)
+DELETE FROM orders WHERE amount = 100;
+SELECT 'DELETE_MIN' as test, * FROM imv_order_summary ORDER BY product, category;
 
--- Test 4: Deletes
-DELETE FROM test_orders WHERE product = 'Shirt';
+-- Test DELETE of MAX (forces recompute)
+DELETE FROM orders WHERE amount = 1500;
+SELECT 'DELETE_MAX' as test, * FROM imv_order_summary ORDER BY product, category;
 
-SELECT 'Table: mv_product_category (after deletes)' AS test_4_mv1;
-SELECT * FROM mv_product_category ORDER BY product, category;
-SELECT 'Table: mv_full_summary (after deletes)' AS test_4_mv2;
-SELECT * FROM mv_full_summary ORDER BY product, category, location;
+-- Cleanup
+SELECT drop_incremental_mv('order_summary');
+DROP MATERIALIZED VIEW order_summary;
+DROP TABLE orders;
