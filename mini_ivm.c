@@ -897,6 +897,14 @@ drop_incremental_mv(PG_FUNCTION_ARGS)
 
     SPI_connect();
 
+    /* Extract elements from grouping columns text array */
+    deconstruct_array(group_cols_arr, TEXTOID, -1, false, TYPALIGN_INT,
+                      &group_cols_datums, &group_cols_nulls, &num_cols);
+
+    if (num_cols <= 0)
+        elog(ERROR, "At least one grouping column must be specified");
+
+    /* 1. Create dynamic IMMV table */
     initStringInfo(&query);
     appendStringInfo(&query,
         "SELECT schemaname FROM pg_catalog.pg_matviews "
