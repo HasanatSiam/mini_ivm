@@ -1,6 +1,6 @@
-# Roadmap: From `mini_ivm` to a Production-Grade IVM Extension
+# Roadmap: From `mini_ivm` to `pg_ivm` (Production IVM Extension)
 
-This document outlines a step-by-step development plan to evolve `mini_ivm` from a basic, trigger-based counter into a robust Incremental Materialized View (IVM) engine similar to `pg_ivm`. It also serves as a learning path for mastering PostgreSQL C extension development.
+This document outlines a progressive, step-by-step learning and development roadmap to evolve `mini_ivm` from a basic row-level trigger counter into a production-grade Incremental Materialized View (IVM) engine matching the architecture of `pg_ivm`.
 
 ---
 
@@ -9,89 +9,102 @@ This document outlines a step-by-step development plan to evolve `mini_ivm` from
 Before building complex features, you need a solid grasp of how PostgreSQL works under the hood.
 
 **Learning Goals:**
-- Understand PostgreSQL Memory Contexts (`palloc`, `pfree`, `CurrentMemoryContext`). Memory leaks in C will crash your database!
+- Understand PostgreSQL Memory Contexts (`palloc`, `pfree`, `CurrentMemoryContext`, `AllocSetContextCreate`).
 - Learn how PostgreSQL represents data (`Datum`, `Oid`, `TupleDesc`, `HeapTuple`).
-- Understand the PostgreSQL Error Reporting system (`elog`, `ereport`).
+- Understand PostgreSQL Type Cache (`lookup_type_cache`) and generic `Datum` handling.
 
 **Action Items for `mini_ivm`:**
-- [ ] **Memory Management Audit:** Review `mini_ivm.c` to ensure all dynamically allocated memory (`palloc`ed strings/arrays) is properly managed, or rely correctly on the per-tuple memory context being reset.
-- [ ] **Data Type Handling:** Currently, `mini_ivm` assumes all grouping columns can be cast to/from `TEXT`. Enhance it to use PostgreSQL's type cache to handle any data type (e.g., `INT`, `UUID`, `TIMESTAMP`) generically without converting everything to C-strings first.
+- [x] **Memory Management Audit:** Review `mini_ivm.c` to ensure all dynamically allocated memory (`palloc`ed strings/arrays) is properly managed, using transient memory contexts (`AllocSetContextCreate`/`MemoryContextDelete`) and explicit `pfree` deallocations.
+- [ ] **Data Type Handling:** Currently, `mini_ivm` assumes grouping columns can be cast to/from `TEXT`. Enhance it to use PostgreSQL's type cache (`lookup_type_cache`) to handle any data type (e.g., `INT`, `UUID`, `TIMESTAMP`) generically without converting everything to C-strings first.
 
 ---
 
-## Phase 2: Statement-Level Processing & Bulk Operations
+## Phase 2: Transition Tables & Statement-Level Maintenance
 
-Currently, `mini_ivm` uses `FOR EACH ROW` triggers. If a user runs `UPDATE orders SET amount = amount + 10` on 1 million rows, your C function runs 1 million times, executing 1 million individual `SPI_execute` calls. This is too slow for production.
+Currently, `mini_ivm` uses `FOR EACH ROW` triggers. If a user updates 1 million rows in `orders`, `mini_ivm` runs 1 million times with 1 million SPI executions. Production `pg_ivm` operates on statement-level deltas.
 
 **Learning Goals:**
 - Statement-level triggers (`FOR EACH STATEMENT`).
-- Transition Tables (`REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table`).
+- Ephemeral Transition Tables (`REFERENCING NEW TABLE AS new_table OLD TABLE AS old_table`).
+- Algebraic delta calculations over transition table sets.
 
 **Action Items for `mini_ivm`:**
-- [ ] **Switch to Transition Tables:** Modify `create_incremental_mv` to create a statement-level trigger.
-- [ ] **Batch Processing:** Inside the C function, instead of reading one `HeapTuple`, execute a query against the transition tables to aggregate all changes in the statement into a single internal "delta" set.
-- [ ] **Batch Upsert:** Apply the entire delta set to the materialized view in a single SQL operation (e.g., `INSERT ... ON CONFLICT ...`) rather than looping.
+- [ ] **Switch to Transition Tables:** Modify `create_incremental_mv` to create `FOR EACH STATEMENT` triggers.
+- [ ] **Batch Processing:** Inside the C trigger, query transition tables (`new_table` and `old_table`) to compute a single aggregated "delta set" for the statement.
+- [ ] **Batch Upsert:** Apply the entire aggregated delta set to the materialized view in a single SQL operation (`INSERT ... ON CONFLICT ... DO UPDATE`) rather than looping per tuple.
 
 ---
 
-## Phase 3: Moving Beyond SPI (Server Programming Interface)
+## Phase 3: Catalog Tables, Metadata & ProcessUtility Hook
 
-SPI is the easiest way to execute SQL from C, but it adds overhead because it goes through the SQL parser and planner every time (even with prepared statements). `pg_ivm` and built-in features use lower-level APIs.
-
-**Learning Goals:**
-- The PostgreSQL Executor (`ExecInsert`, `ExecUpdate`, `ExecDelete`).
-- Table Access Methods (TAM) (`table_open`, `table_beginscan`, `heap_insert`).
-- Index lookups from C (`index_beginscan`, `index_rescan`).
-
-**Action Items for `mini_ivm`:**
-- [ ] **Direct Table Access:** Replace `SPI_execute` for garbage collection (`DELETE FROM ... WHERE total_count <= 0`) with a direct index scan to find the tuple, and `simple_heap_delete` to remove it.
-- [ ] **Direct Upserts:** Replace the `SPI_execute_plan` upsert with lower-level executor calls to modify the view table directly.
-
----
-
-## Phase 4: AST Parsing and Real View Definitions
-
-Real IVM extensions don't ask users to pass array columns to a setup function. Users write standard SQL: `CREATE INCREMENTAL MATERIALIZED VIEW my_view AS SELECT a, b, count(*) FROM table GROUP BY a, b;`.
+Real IVM extensions like `pg_ivm` don't require users to pass comma-separated column arrays to setup functions. Users write standard SQL (`CREATE INCREMENTAL MATERIALIZED VIEW ...`).
 
 **Learning Goals:**
-- PostgreSQL Parser (`raw_parser`).
-- Process Utility Hook (`ProcessUtility_hook`) to intercept commands like `CREATE MATERIALIZED VIEW`.
+- ProcessUtility Hook (`ProcessUtility_hook`) to intercept utility statements.
 - Abstract Syntax Trees (AST) in PostgreSQL (`Query`, `TargetEntry`, `Aggref`).
+- Extension System Catalog Tables (storing view definitions & tracking metadata).
 
 **Action Items for `mini_ivm`:**
-- [ ] **Hook `ProcessUtility`:** Intercept SQL commands. Look for a custom syntax or intercept standard view creation.
-- [x] **Parse the Query Tree:** When a user creates a view, analyze the `SELECT` query tree to automatically determine the base table(s), the grouping columns, and the aggregates used.
-- [ ] **Store Metadata:** Create a catalog table (e.g., `mini_ivm_views`) to store this parsed metadata so the triggers know exactly how to maintain the view.
+- [x] **Parse the Query Tree:** Analyze the `SELECT` query tree to automatically determine base table(s), grouping columns, and aggregate functions.
+- [ ] **Catalog Metadata Storage:** Create an internal catalog table (e.g., `mini_ivm_catalog`) to store parsed view definitions, base table mappings, and grouping column metadata instead of encoding them into trigger argument strings.
+- [ ] **Hook `ProcessUtility`:** Intercept SQL commands like `CREATE INCREMENTAL MATERIALIZED VIEW` or custom DDL syntax to automate IMMV creation transparently.
 
 ---
 
-## Phase 5: Supporting Complex Aggregates and Joins
+## Phase 4: Algebraic Maintenance, Multi-Set Counts & Duplicates
 
-Currently, `mini_ivm` only counts. A real IVM needs `SUM`, `AVG`, `MIN`, `MAX`, and the ability to join multiple base tables.
+In real relational algebra, IVM requires tracking tuple multiplicities and managing zero-count tuples.
 
 **Learning Goals:**
-- Aggregate state transition functions.
-- The mathematics of incremental view maintenance (e.g., how do you incrementally maintain a `MAX()` if the current maximum value is deleted? You need to keep a count of all values).
-- Delta rules for Joins (e.g., `Δ(A ⨝ B) = (ΔA ⨝ B) ∪ (A ⨝ ΔB) ∪ (ΔA ⨝ ΔB)`).
+- Relational algebra for IVM.
+- The `__ivm_count__` auxiliary tuple count column pattern used by `pg_ivm`.
+- Zero-count tuple garbage collection rules.
 
 **Action Items for `mini_ivm`:**
-- [x] **Implement `SUM`:** Add support for tracking `SUM(column)`.
-- [ ] **Implement `AVG`:** Add support for `AVG` by tracking both `SUM` and `COUNT` internally.
-- [x] **Single-table `MIN`/`MAX`:** Implement algorithms to maintain extrema efficiently.
-- [ ] **Multi-table Joins:** Update the AST parser to understand `JOIN`s. Create triggers on *all* underlying base tables. When Table A changes, use the transition tables of A joined against the current state of Table B to calculate the delta for the view.
+- [ ] **Add Hidden Count Column (`__ivm_count__`):** Introduce an auxiliary `__ivm_count__ BIGINT` column to the IMMV table to track exact tuple counts across operations and handle duplicates correctly.
+- [ ] **Zero-Count Garbage Collection:** Delete rows when `__ivm_count__ <= 0`.
+
+---
+
+## Phase 5: Moving Beyond SPI to Lower-Level Executor APIs
+
+SPI adds SQL parser/planner overhead for every execution. Production `pg_ivm` and PostgreSQL core bypass SPI using lower-level Executor APIs.
+
+**Learning Goals:**
+- The PostgreSQL Executor API (`ExecutorStart`, `ExecutorRun`, `ExecutorEnd`).
+- Table Access Methods (TAM) (`table_open`, `table_beginscan`, `heap_insert`).
+- Direct index lookups from C (`index_beginscan`, `index_rescan`).
+
+**Action Items for `mini_ivm`:**
+- [ ] **Direct Index Scanning & Deletes:** Replace SPI garbage collection with direct index scans and `simple_heap_delete`.
+- [ ] **Direct Table Modification:** Use lower-level executor routines to modify IMMV tuples directly without SPI SQL re-parsing.
+
+---
+
+## Phase 6: Supporting Complex Aggregates and Multi-Table Joins
+
+Production `pg_ivm` handles `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, and multi-table `JOIN`s.
+
+**Learning Goals:**
+- Delta rules for Joins: `Δ(R ⨝ S) = (ΔR ⨝ S) ∪ (R ⨝ ΔS) ∪ (ΔR ⨝ ΔS)`.
+- Aggregate state transition functions and maintaining extrema (`MIN`/`MAX`).
+
+**Action Items for `mini_ivm`:**
+- [x] **Implement `SUM`:** Track and update `SUM(column)`.
+- [ ] **Implement `AVG`:** Support `AVG` by tracking both `SUM` and `COUNT` internally.
+- [x] **Single-Table `MIN`/`MAX`:** Maintain extrema efficiently when rows are deleted or updated.
+- [ ] **Multi-Table Joins:** Extend AST parser to understand `JOIN` queries. Create triggers on *all* referenced base tables and evaluate delta join rules against current base table states.
 
 ---
 
 ## Recommended Learning Resources
 
 1. **The Source Code:**
-   - [PostgreSQL Source Tree (`src/backend/`)] - The ultimate source of truth. Read the comments in `src/include/executor/executor.h` and `src/include/access/heapam.h`.
-   - [pg_ivm Source Code](https://github.com/sraoss/pg_ivm) - Study how they intercept utility commands and calculate deltas.
-   - [Citus Source Code](https://github.com/citusdata/citus) - Excellent examples of hooking into the planner and executor.
+   - [PostgreSQL Source Tree (`src/backend/`)] - The ultimate source of truth (`src/include/executor/executor.h`, `src/include/access/heapam.h`).
+   - [pg_ivm Source Code](https://github.com/sraoss/pg_ivm) - Study `pg_ivm`'s AST analysis, delta query generation, and IMMV catalog management.
+   - [Citus Source Code](https://github.com/citusdata/citus) - Excellent examples of `ProcessUtility_hook` and executor hooks.
 
 2. **Books & Documentation:**
-   - [The Internals of PostgreSQL](https://www.interdb.jp/pg/) - Absolutely essential reading for understanding PostgreSQL architecture.
+   - [The Internals of PostgreSQL](https://www.interdb.jp/pg/) - Essential architectural guide for PostgreSQL internals.
    - [PostgreSQL Extension Development Documentation](https://www.postgresql.org/docs/current/extend.html).
 
-3. **Community:**
-   - `pgsql-hackers` Mailing List - Where PostgreSQL development happens. Search the archives for discussions on IVM.
