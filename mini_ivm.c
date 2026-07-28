@@ -3,6 +3,7 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "catalog/pg_type.h"
 #include "parser/parser.h"
 #include "nodes/parsenodes.h"
@@ -77,6 +78,7 @@ parse_trigger_args(int nargs, char **args)
         i++;
         tok = strtok(NULL, ",");
     }
+    pfree(copy);
 
     copy = pstrdup(args[3]);
     count = 1;
@@ -118,8 +120,49 @@ parse_trigger_args(int nargs, char **args)
         i++;
         tok = strtok(NULL, ",");
     }
+    pfree(copy);
 
     return cfg;
+}
+
+static void
+free_mv_config(MvConfig *cfg)
+{
+    int i;
+
+    if (!cfg)
+        return;
+    if (cfg->agg_table)
+        pfree(cfg->agg_table);
+    if (cfg->source_table)
+        pfree(cfg->source_table);
+    if (cfg->group_cols)
+    {
+        for (i = 0; i < cfg->n_group_cols; i++)
+        {
+            if (cfg->group_cols[i])
+                pfree(cfg->group_cols[i]);
+            if (cfg->group_type_names && cfg->group_type_names[i])
+                pfree(cfg->group_type_names[i]);
+        }
+        pfree(cfg->group_cols);
+    }
+    if (cfg->group_type_names)
+        pfree(cfg->group_type_names);
+    if (cfg->aggs)
+    {
+        for (i = 0; i < cfg->n_aggs; i++)
+        {
+            if (cfg->aggs[i].source_column)
+                pfree(cfg->aggs[i].source_column);
+            if (cfg->aggs[i].target_column)
+                pfree(cfg->aggs[i].target_column);
+            if (cfg->aggs[i].type_name)
+                pfree(cfg->aggs[i].type_name);
+        }
+        pfree(cfg->aggs);
+    }
+    pfree(cfg);
 }
 
 static void
@@ -568,6 +611,8 @@ mini_ivm_maintain(PG_FUNCTION_ARGS)
     TupleDesc tupdesc;
     Trigger *trigger;
     MvConfig *cfg;
+    MemoryContext oldcontext;
+    MemoryContext tmpcontext;
 
     if (!CALLED_AS_TRIGGER(fcinfo))
         elog(ERROR, "mini_ivm_maintain must be called as a trigger");
@@ -575,6 +620,11 @@ mini_ivm_maintain(PG_FUNCTION_ARGS)
     trigdata = (TriggerData *) fcinfo->context;
     tupdesc = trigdata->tg_relation->rd_att;
     trigger = trigdata->tg_trigger;
+
+    tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+                                       "mini_ivm temporary context",
+                                       ALLOCSET_DEFAULT_SIZES);
+    oldcontext = MemoryContextSwitchTo(tmpcontext);
 
     cfg = parse_trigger_args(trigger->tgnargs, trigger->tgargs);
 
@@ -588,6 +638,11 @@ mini_ivm_maintain(PG_FUNCTION_ARGS)
         apply_update(trigdata->tg_trigtuple, trigdata->tg_newtuple, tupdesc, cfg);
 
     SPI_finish();
+
+    free_mv_config(cfg);
+
+    MemoryContextSwitchTo(oldcontext);
+    MemoryContextDelete(tmpcontext);
 
     if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
         PG_RETURN_POINTER(trigdata->tg_newtuple);
