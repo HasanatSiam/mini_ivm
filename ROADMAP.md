@@ -15,7 +15,7 @@ Before building complex features, you need a solid grasp of how PostgreSQL works
 
 **Action Items for `mini_ivm`:**
 - [x] **Memory Management Audit:** Review `mini_ivm.c` to ensure all dynamically allocated memory (`palloc`ed strings/arrays) is properly managed, using transient memory contexts (`AllocSetContextCreate`/`MemoryContextDelete`) and explicit `pfree` deallocations.
-- [ ] **Data Type Handling:** Currently, `mini_ivm` assumes grouping columns can be cast to/from `TEXT`. Enhance it to use PostgreSQL's type cache (`lookup_type_cache`) to handle any data type (e.g., `INT`, `UUID`, `TIMESTAMP`) generically without converting everything to C-strings first.
+- [x] **Data Type Handling:** Currently, `mini_ivm` assumes grouping columns can be cast to/from `TEXT`. Enhance it to use PostgreSQL's type cache (`lookup_type_cache`) to handle any data type (e.g., `INT`, `UUID`, `TIMESTAMP`) generically without converting everything to C-strings first.
 
 ---
 
@@ -29,9 +29,9 @@ Currently, `mini_ivm` uses `FOR EACH ROW` triggers. If a user updates 1 million 
 - Algebraic delta calculations over transition table sets.
 
 **Action Items for `mini_ivm`:**
-- [ ] **Switch to Transition Tables:** Modify `create_incremental_mv` to create `FOR EACH STATEMENT` triggers.
-- [ ] **Batch Processing:** Inside the C trigger, query transition tables (`new_table` and `old_table`) to compute a single aggregated "delta set" for the statement.
-- [ ] **Batch Upsert:** Apply the entire aggregated delta set to the materialized view in a single SQL operation (`INSERT ... ON CONFLICT ... DO UPDATE`) rather than looping per tuple.
+- [x] **Switch to Transition Tables:** Modify `create_incremental_mv` to create `FOR EACH STATEMENT` triggers.
+- [x] **Batch Processing:** Inside the C trigger, query transition tables (`new_table` and `old_table`) to compute a single aggregated "delta set" for the statement.
+- [x] **Batch Upsert:** Apply the entire aggregated delta set to the materialized view in a single SQL operation (`INSERT ... ON CONFLICT ... DO UPDATE`) rather than looping per tuple.
 
 ---
 
@@ -46,7 +46,7 @@ Real IVM extensions like `pg_ivm` don't require users to pass comma-separated co
 
 **Action Items for `mini_ivm`:**
 - [x] **Parse the Query Tree:** Analyze the `SELECT` query tree to automatically determine base table(s), grouping columns, and aggregate functions.
-- [ ] **Catalog Metadata Storage:** Create an internal catalog table (e.g., `mini_ivm_catalog`) to store parsed view definitions, base table mappings, and grouping column metadata instead of encoding them into trigger argument strings.
+- [x] **Catalog Metadata Storage:** Create an internal catalog table (e.g., `mini_ivm_catalog`) to store parsed view definitions, base table mappings, and grouping column metadata instead of encoding them into trigger argument strings.
 - [ ] **Hook `ProcessUtility`:** Intercept SQL commands like `CREATE INCREMENTAL MATERIALIZED VIEW` or custom DDL syntax to automate IMMV creation transparently.
 
 ---

@@ -4,13 +4,77 @@
 #include "executor/spi.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/typcache.h"
+#include "utils/datum.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_collation.h"
 #include "parser/parser.h"
 #include "nodes/parsenodes.h"
 #include "nodes/value.h"
 #include "nodes/nodes.h"
+#include "tcop/utility.h"
 
 PG_MODULE_MAGIC;
+
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+static void
+mini_ivm_ProcessUtility(PlannedStmt *pstmt,
+                        const char *queryString,
+                        bool read_only_tree,
+                        ProcessUtilityContext context,
+                        ParamListInfo params,
+                        QueryEnvironment *queryEnv,
+                        DestReceiver *dest,
+                        QueryCompletion *qc)
+{
+    if (prev_ProcessUtility)
+        prev_ProcessUtility(pstmt, queryString, read_only_tree,
+                            context, params, queryEnv, dest, qc);
+    else
+        standard_ProcessUtility(pstmt, queryString, read_only_tree,
+                                context, params, queryEnv, dest, qc);
+}
+
+void _PG_init(void);
+void _PG_fini(void);
+
+void
+_PG_init(void)
+{
+    prev_ProcessUtility = ProcessUtility_hook;
+    ProcessUtility_hook = mini_ivm_ProcessUtility;
+}
+
+void
+_PG_fini(void)
+{
+    ProcessUtility_hook = prev_ProcessUtility;
+}
+
+
+
+static bool
+datum_equal(Datum val1, bool null1, Datum val2, bool null2, Oid type_oid)
+{
+    TypeCacheEntry *typentry;
+
+    if (null1 && null2)
+        return true;
+    if (null1 || null2)
+        return false;
+
+    typentry = lookup_type_cache(type_oid, TYPECACHE_EQ_OPR_FINFO);
+    if (OidIsValid(typentry->eq_opr) && typentry->eq_opr_finfo.fn_oid != InvalidOid)
+    {
+        return DatumGetBool(FunctionCall2Coll(&typentry->eq_opr_finfo,
+                                              DEFAULT_COLLATION_OID,
+                                              val1, val2));
+    }
+
+    return datumIsEqual(val1, val2, typentry->typbyval, typentry->typlen);
+}
+
 
 typedef enum { AGG_SUM, AGG_COUNT, AGG_MIN, AGG_MAX } AggFuncType;
 
@@ -128,41 +192,153 @@ parse_trigger_args(int nargs, char **args)
 static void
 free_mv_config(MvConfig *cfg)
 {
-    int i;
+    (void) cfg;
+}
 
-    if (!cfg)
-        return;
-    if (cfg->agg_table)
-        pfree(cfg->agg_table);
-    if (cfg->source_table)
-        pfree(cfg->source_table);
-    if (cfg->group_cols)
+static char **
+split_csv(const char *input, int *out_count)
+{
+    char **tokens;
+    char *copy, *p, *start;
+    int count = 1, i = 0;
+
+    if (!input || !*input)
     {
-        for (i = 0; i < cfg->n_group_cols; i++)
-        {
-            if (cfg->group_cols[i])
-                pfree(cfg->group_cols[i]);
-            if (cfg->group_type_names && cfg->group_type_names[i])
-                pfree(cfg->group_type_names[i]);
-        }
-        pfree(cfg->group_cols);
+        *out_count = 0;
+        return NULL;
     }
-    if (cfg->group_type_names)
-        pfree(cfg->group_type_names);
-    if (cfg->aggs)
+
+    for (p = (char *)input; *p; p++)
+        if (*p == ',') count++;
+
+    tokens = palloc0(count * sizeof(char *));
+    copy = pstrdup(input);
+    start = copy;
+
+    for (p = copy; *p != '\0'; p++)
     {
-        for (i = 0; i < cfg->n_aggs; i++)
+        if (*p == ',')
         {
-            if (cfg->aggs[i].source_column)
-                pfree(cfg->aggs[i].source_column);
-            if (cfg->aggs[i].target_column)
-                pfree(cfg->aggs[i].target_column);
-            if (cfg->aggs[i].type_name)
-                pfree(cfg->aggs[i].type_name);
+            *p = '\0';
+            if (i < count)
+                tokens[i++] = pstrdup(start);
+            start = p + 1;
         }
-        pfree(cfg->aggs);
     }
-    pfree(cfg);
+    if (i < count && start)
+        tokens[i++] = pstrdup(start);
+
+    pfree(copy);
+    *out_count = i;
+    return tokens;
+}
+
+static MvConfig *
+load_mv_config_from_catalog(const char *agg_table_name)
+{
+    StringInfoData query;
+    MvConfig *cfg;
+    char *src_table, *g_cols_raw, *a_def_raw;
+    char **g_tokens, **a_tokens;
+    int n_g, n_a, i;
+
+    initStringInfo(&query);
+    appendStringInfo(&query,
+        "SELECT source_table, group_cols, aggs_def "
+        "FROM mini_ivm_catalog WHERE agg_table = '%s'",
+        agg_table_name);
+
+    if (SPI_execute(query.data, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
+        elog(ERROR, "Catalog entry for IMMV table \"%s\" not found", agg_table_name);
+
+    {
+        char *v1 = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+        char *v2 = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+        char *v3 = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+
+        if (!v1 || !v2 || !v3)
+            elog(ERROR, "Catalog tuple for \"%s\" contains NULL values", agg_table_name);
+
+        src_table  = pstrdup(v1);
+        g_cols_raw = pstrdup(v2);
+        a_def_raw  = pstrdup(v3);
+    }
+    SPI_freetuptable(SPI_tuptable);
+
+    cfg = palloc0(sizeof(MvConfig));
+    cfg->agg_table   = pstrdup(agg_table_name);
+    cfg->source_table = src_table;
+
+    g_tokens = split_csv(g_cols_raw, &n_g);
+    cfg->n_group_cols = n_g;
+    cfg->group_cols = palloc0(n_g * sizeof(char *));
+    cfg->group_type_names = palloc0(n_g * sizeof(char *));
+
+    for (i = 0; i < n_g; i++)
+    {
+        char *tok = g_tokens[i];
+        char *colon = strchr(tok, ':');
+        if (!colon)
+            elog(ERROR, "Invalid group col in catalog: %s", tok);
+        *colon = '\0';
+        cfg->group_cols[i] = pstrdup(tok);
+        cfg->group_type_names[i] = pstrdup(colon + 1);
+    }
+
+    a_tokens = split_csv(a_def_raw, &n_a);
+    cfg->n_aggs = n_a;
+    cfg->aggs = palloc0(n_a * sizeof(AggDef));
+
+    for (i = 0; i < n_a; i++)
+    {
+        char *func_s, *col_s, *alias_s, *type_s;
+        char *p1, *p2, *p3;
+        char *tok = a_tokens[i];
+
+        p1 = strchr(tok, ':');
+        p2 = p1 ? strchr(p1 + 1, ':') : NULL;
+        p3 = p2 ? strchr(p2 + 1, ':') : NULL;
+
+        if (!p1 || !p2 || !p3)
+            elog(ERROR, "Invalid agg def token in catalog: \"%s\" (raw aggs_def=\"%s\")", tok, a_def_raw);
+
+        *p1 = '\0';
+        *p2 = '\0';
+        *p3 = '\0';
+
+        func_s  = tok;
+        col_s   = p1 + 1;
+        alias_s = p2 + 1;
+        type_s  = p3 + 1;
+
+        if (strcasecmp(func_s, "SUM") == 0)
+            cfg->aggs[i].func_type = AGG_SUM;
+        else if (strcasecmp(func_s, "COUNT") == 0)
+            cfg->aggs[i].func_type = AGG_COUNT;
+        else if (strcasecmp(func_s, "MIN") == 0)
+            cfg->aggs[i].func_type = AGG_MIN;
+        else if (strcasecmp(func_s, "MAX") == 0)
+            cfg->aggs[i].func_type = AGG_MAX;
+        else
+            elog(ERROR, "Unknown aggregate in catalog: %s", func_s);
+
+        cfg->aggs[i].is_star       = (col_s != NULL && strcmp(col_s, "*") == 0);
+        cfg->aggs[i].source_column = pstrdup(col_s);
+        cfg->aggs[i].target_column = pstrdup(alias_s);
+        cfg->aggs[i].type_name     = pstrdup(type_s);
+    }
+
+    for (i = 0; i < n_g; i++)
+        if (g_tokens[i]) pfree(g_tokens[i]);
+    if (g_tokens) pfree(g_tokens);
+    pfree(g_cols_raw);
+
+    for (i = 0; i < n_a; i++)
+        if (a_tokens[i]) pfree(a_tokens[i]);
+    if (a_tokens) pfree(a_tokens);
+    pfree(a_def_raw);
+
+    return cfg;
 }
 
 static void
@@ -415,15 +591,18 @@ apply_update(HeapTuple oldtuple, HeapTuple newtuple, TupleDesc tupdesc, MvConfig
     for (i = 0; i < cfg->n_group_cols; i++)
     {
         int attnum = SPI_fnumber(tupdesc, cfg->group_cols[i]);
-        char *old_val, *new_val;
+        Datum old_val, new_val;
+        bool old_null, new_null;
+        Oid type_oid;
 
         if (attnum == SPI_ERROR_NOATTRIBUTE)
             elog(ERROR, "Column \"%s\" not found", cfg->group_cols[i]);
-        old_val = get_text_value(oldtuple, tupdesc, attnum);
-        new_val = get_text_value(newtuple, tupdesc, attnum);
-        if ((old_val == NULL && new_val != NULL) ||
-            (old_val != NULL && new_val == NULL) ||
-            (old_val != NULL && new_val != NULL && strcmp(old_val, new_val) != 0))
+
+        type_oid = TupleDescAttr(tupdesc, attnum - 1)->atttypid;
+        old_val = SPI_getbinval(oldtuple, tupdesc, attnum, &old_null);
+        new_val = SPI_getbinval(newtuple, tupdesc, attnum, &new_null);
+
+        if (!datum_equal(old_val, old_null, new_val, new_null, type_oid))
         {
             group_changed = true;
             break;
@@ -441,18 +620,21 @@ apply_update(HeapTuple oldtuple, HeapTuple newtuple, TupleDesc tupdesc, MvConfig
     {
         AggDef *agg = &cfg->aggs[i];
         int attnum;
-        char *old_val, *new_val;
+        Datum old_val, new_val;
+        bool old_null, new_null;
+        Oid type_oid;
 
         if (agg->func_type == AGG_COUNT)
             continue;
         attnum = SPI_fnumber(tupdesc, agg->source_column);
         if (attnum == SPI_ERROR_NOATTRIBUTE)
             continue;
-        old_val = get_text_value(oldtuple, tupdesc, attnum);
-        new_val = get_text_value(newtuple, tupdesc, attnum);
-        if ((old_val == NULL && new_val != NULL) ||
-            (old_val != NULL && new_val == NULL) ||
-            (old_val != NULL && new_val != NULL && strcmp(old_val, new_val) != 0))
+
+        type_oid = TupleDescAttr(tupdesc, attnum - 1)->atttypid;
+        old_val = SPI_getbinval(oldtuple, tupdesc, attnum, &old_null);
+        new_val = SPI_getbinval(newtuple, tupdesc, attnum, &new_null);
+
+        if (!datum_equal(old_val, old_null, new_val, new_null, type_oid))
         {
             value_changed = true;
             break;
@@ -602,6 +784,192 @@ apply_update(HeapTuple oldtuple, HeapTuple newtuple, TupleDesc tupdesc, MvConfig
     SPI_execute(query.data, false, 0);
 }
 
+static void
+apply_statement_insert(MvConfig *cfg)
+{
+    StringInfoData query;
+    int i;
+
+    initStringInfo(&query);
+    appendStringInfo(&query, "INSERT INTO %s (", cfg->agg_table);
+    for (i = 0; i < cfg->n_group_cols; i++)
+        appendStringInfo(&query, "%s, ", cfg->group_cols[i]);
+    for (i = 0; i < cfg->n_aggs; i++)
+        appendStringInfo(&query, "%s%s", cfg->aggs[i].target_column,
+                        (i == cfg->n_aggs - 1) ? "" : ", ");
+
+    appendStringInfoString(&query, ") SELECT ");
+    for (i = 0; i < cfg->n_group_cols; i++)
+        appendStringInfo(&query, "%s, ", cfg->group_cols[i]);
+    for (i = 0; i < cfg->n_aggs; i++)
+    {
+        AggDef *agg = &cfg->aggs[i];
+        switch (agg->func_type)
+        {
+            case AGG_SUM:
+                appendStringInfo(&query, "SUM(%s)", agg->source_column);
+                break;
+            case AGG_COUNT:
+                appendStringInfo(&query, "COUNT(%s)", agg->is_star ? "*" : agg->source_column);
+                break;
+            case AGG_MIN:
+                appendStringInfo(&query, "MIN(%s)", agg->source_column);
+                break;
+            case AGG_MAX:
+                appendStringInfo(&query, "MAX(%s)", agg->source_column);
+                break;
+        }
+        appendStringInfoString(&query, (i == cfg->n_aggs - 1) ? "" : ", ");
+    }
+    appendStringInfoString(&query, " FROM new_table GROUP BY ");
+    for (i = 0; i < cfg->n_group_cols; i++)
+        appendStringInfo(&query, "%s%s", cfg->group_cols[i],
+                        (i == cfg->n_group_cols - 1) ? "" : ", ");
+
+    appendStringInfoString(&query, " ON CONFLICT (");
+    for (i = 0; i < cfg->n_group_cols; i++)
+        appendStringInfo(&query, "%s%s", cfg->group_cols[i],
+                        (i == cfg->n_group_cols - 1) ? "" : ", ");
+    appendStringInfoString(&query, ") DO UPDATE SET ");
+
+    for (i = 0; i < cfg->n_aggs; i++)
+    {
+        AggDef *agg = &cfg->aggs[i];
+        if (i > 0) appendStringInfoString(&query, ", ");
+        appendStringInfo(&query, "%s = ", agg->target_column);
+        switch (agg->func_type)
+        {
+            case AGG_SUM:
+            case AGG_COUNT:
+                appendStringInfo(&query, "%s.%s + EXCLUDED.%s",
+                                cfg->agg_table, agg->target_column, agg->target_column);
+                break;
+            case AGG_MIN:
+                appendStringInfo(&query, "LEAST(%s.%s, EXCLUDED.%s)",
+                                cfg->agg_table, agg->target_column, agg->target_column);
+                break;
+            case AGG_MAX:
+                appendStringInfo(&query, "GREATEST(%s.%s, EXCLUDED.%s)",
+                                cfg->agg_table, agg->target_column, agg->target_column);
+                break;
+        }
+    }
+
+    SPI_execute(query.data, false, 0);
+}
+
+static void
+apply_statement_delete(MvConfig *cfg)
+{
+    StringInfoData query;
+    StringInfoData where_match;
+    int i;
+
+    initStringInfo(&where_match);
+    for (i = 0; i < cfg->n_group_cols; i++)
+    {
+        if (i > 0) appendStringInfoString(&where_match, " AND ");
+        appendStringInfo(&where_match, "s.%s = delta.%s",
+                        cfg->group_cols[i], cfg->group_cols[i]);
+    }
+
+    initStringInfo(&query);
+    appendStringInfo(&query, "UPDATE %s SET ", cfg->agg_table);
+    for (i = 0; i < cfg->n_aggs; i++)
+    {
+        AggDef *agg = &cfg->aggs[i];
+        if (i > 0) appendStringInfoString(&query, ", ");
+        appendStringInfo(&query, "%s = ", agg->target_column);
+
+        switch (agg->func_type)
+        {
+            case AGG_SUM:
+            case AGG_COUNT:
+                appendStringInfo(&query, "%s.%s - delta.%s",
+                                cfg->agg_table, agg->target_column, agg->target_column);
+                break;
+            case AGG_MIN:
+                appendStringInfo(&query,
+                    "CASE WHEN delta.%s = %s.%s "
+                    "THEN (SELECT COALESCE(MIN(%s), CAST(0 AS %s)) FROM %s s WHERE %s) "
+                    "ELSE %s.%s END",
+                    agg->target_column, cfg->agg_table, agg->target_column,
+                    agg->source_column, agg->type_name,
+                    cfg->source_table, where_match.data,
+                    cfg->agg_table, agg->target_column);
+                break;
+            case AGG_MAX:
+                appendStringInfo(&query,
+                    "CASE WHEN delta.%s = %s.%s "
+                    "THEN (SELECT COALESCE(MAX(%s), CAST(0 AS %s)) FROM %s s WHERE %s) "
+                    "ELSE %s.%s END",
+                    agg->target_column, cfg->agg_table, agg->target_column,
+                    agg->source_column, agg->type_name,
+                    cfg->source_table, where_match.data,
+                    cfg->agg_table, agg->target_column);
+                break;
+        }
+    }
+
+    appendStringInfoString(&query, " FROM (SELECT ");
+    for (i = 0; i < cfg->n_group_cols; i++)
+        appendStringInfo(&query, "%s, ", cfg->group_cols[i]);
+    for (i = 0; i < cfg->n_aggs; i++)
+    {
+        AggDef *agg = &cfg->aggs[i];
+        switch (agg->func_type)
+        {
+            case AGG_SUM:
+                appendStringInfo(&query, "SUM(%s) AS %s", agg->source_column, agg->target_column);
+                break;
+            case AGG_COUNT:
+                appendStringInfo(&query, "COUNT(%s) AS %s", agg->is_star ? "*" : agg->source_column, agg->target_column);
+                break;
+            case AGG_MIN:
+                appendStringInfo(&query, "MIN(%s) AS %s", agg->source_column, agg->target_column);
+                break;
+            case AGG_MAX:
+                appendStringInfo(&query, "MAX(%s) AS %s", agg->source_column, agg->target_column);
+                break;
+        }
+        appendStringInfoString(&query, (i == cfg->n_aggs - 1) ? "" : ", ");
+    }
+    appendStringInfoString(&query, " FROM old_table GROUP BY ");
+    for (i = 0; i < cfg->n_group_cols; i++)
+        appendStringInfo(&query, "%s%s", cfg->group_cols[i],
+                        (i == cfg->n_group_cols - 1) ? "" : ", ");
+    appendStringInfoString(&query, ") AS delta WHERE ");
+
+    for (i = 0; i < cfg->n_group_cols; i++)
+    {
+        if (i > 0) appendStringInfoString(&query, " AND ");
+        appendStringInfo(&query, "%s.%s = delta.%s",
+                        cfg->agg_table, cfg->group_cols[i], cfg->group_cols[i]);
+    }
+
+    SPI_execute(query.data, false, 0);
+
+    /* Delete rows where count aggregate <= 0 */
+    for (i = 0; i < cfg->n_aggs; i++)
+    {
+        if (cfg->aggs[i].func_type == AGG_COUNT)
+        {
+            resetStringInfo(&query);
+            appendStringInfo(&query, "DELETE FROM %s WHERE %s <= 0",
+                            cfg->agg_table, cfg->aggs[i].target_column);
+            SPI_execute(query.data, false, 0);
+            break;
+        }
+    }
+}
+
+static void
+apply_statement_update(MvConfig *cfg)
+{
+    apply_statement_delete(cfg);
+    apply_statement_insert(cfg);
+}
+
 PG_FUNCTION_INFO_V1(mini_ivm_maintain);
 
 Datum
@@ -611,8 +979,6 @@ mini_ivm_maintain(PG_FUNCTION_ARGS)
     TupleDesc tupdesc;
     Trigger *trigger;
     MvConfig *cfg;
-    MemoryContext oldcontext;
-    MemoryContext tmpcontext;
 
     if (!CALLED_AS_TRIGGER(fcinfo))
         elog(ERROR, "mini_ivm_maintain must be called as a trigger");
@@ -621,14 +987,28 @@ mini_ivm_maintain(PG_FUNCTION_ARGS)
     tupdesc = trigdata->tg_relation->rd_att;
     trigger = trigdata->tg_trigger;
 
-    tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
-                                       "mini_ivm temporary context",
-                                       ALLOCSET_DEFAULT_SIZES);
-    oldcontext = MemoryContextSwitchTo(tmpcontext);
-
-    cfg = parse_trigger_args(trigger->tgnargs, trigger->tgargs);
-
     SPI_connect();
+
+    if (trigger->tgnargs == 1)
+        cfg = load_mv_config_from_catalog(trigger->tgargs[0]);
+    else
+        cfg = parse_trigger_args(trigger->tgnargs, trigger->tgargs);
+
+    if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
+    {
+        SPI_register_trigger_data(trigdata);
+
+        if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+            apply_statement_insert(cfg);
+        else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
+            apply_statement_delete(cfg);
+        else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+            apply_statement_update(cfg);
+
+        SPI_finish();
+        free_mv_config(cfg);
+        PG_RETURN_POINTER(NULL);
+    }
 
     if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
         apply_insert(trigdata->tg_trigtuple, tupdesc, cfg);
@@ -640,9 +1020,6 @@ mini_ivm_maintain(PG_FUNCTION_ARGS)
     SPI_finish();
 
     free_mv_config(cfg);
-
-    MemoryContextSwitchTo(oldcontext);
-    MemoryContextDelete(tmpcontext);
 
     if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
         PG_RETURN_POINTER(trigdata->tg_newtuple);
@@ -916,19 +1293,79 @@ create_incremental_mv(PG_FUNCTION_ARGS)
     appendStringInfoString(&query, " ON CONFLICT DO NOTHING");
     SPI_execute(query.data, false, 0);
 
+    /* Store metadata into mini_ivm_catalog */
+    resetStringInfo(&query);
+    appendStringInfoString(&query,
+        "CREATE TABLE IF NOT EXISTS mini_ivm_catalog ("
+        "    mv_name TEXT PRIMARY KEY,"
+        "    agg_table TEXT NOT NULL,"
+        "    source_table TEXT NOT NULL,"
+        "    group_cols TEXT NOT NULL,"
+        "    aggs_def TEXT NOT NULL"
+        ")");
+    SPI_execute(query.data, false, 0);
+
+    resetStringInfo(&query);
+    appendStringInfo(&query,
+        "DELETE FROM mini_ivm_catalog WHERE mv_name = '%s' OR agg_table = '%s'",
+        mv_name, agg_table_name);
+    SPI_execute(query.data, false, 0);
+
+    resetStringInfo(&query);
+    appendStringInfo(&query,
+        "INSERT INTO mini_ivm_catalog (mv_name, agg_table, source_table, group_cols, aggs_def) "
+        "VALUES ('%s', '%s', '%s', '%s', '%s')",
+        mv_name, agg_table_name, source_table, group_csv.data, agg_csv.data);
+    SPI_execute(query.data, false, 0);
+
     resetStringInfo(&query);
     appendStringInfo(&query, "DROP TRIGGER IF EXISTS mini_ivm_trigger_%s ON \"%s\"",
                     agg_table_name, source_table);
     SPI_execute(query.data, false, 0);
 
     resetStringInfo(&query);
+    appendStringInfo(&query, "DROP TRIGGER IF EXISTS mini_ivm_trig_ins_%s ON \"%s\"",
+                    agg_table_name, source_table);
+    SPI_execute(query.data, false, 0);
+
+    resetStringInfo(&query);
+    appendStringInfo(&query, "DROP TRIGGER IF EXISTS mini_ivm_trig_del_%s ON \"%s\"",
+                    agg_table_name, source_table);
+    SPI_execute(query.data, false, 0);
+
+    resetStringInfo(&query);
+    appendStringInfo(&query, "DROP TRIGGER IF EXISTS mini_ivm_trig_upd_%s ON \"%s\"",
+                    agg_table_name, source_table);
+    SPI_execute(query.data, false, 0);
+
+    /* 1. Statement-level INSERT trigger with catalog lookup */
+    resetStringInfo(&query);
     appendStringInfo(&query,
-        "CREATE TRIGGER mini_ivm_trigger_%s "
-        "AFTER INSERT OR UPDATE OR DELETE ON \"%s\" "
-        "FOR EACH ROW EXECUTE FUNCTION mini_ivm_maintain("
-        "'%s', '%s', '%s', '%s')",
-        agg_table_name, source_table,
-        agg_table_name, source_table, group_csv.data, agg_csv.data);
+        "CREATE TRIGGER mini_ivm_trig_ins_%s "
+        "AFTER INSERT ON \"%s\" "
+        "REFERENCING NEW TABLE AS new_table "
+        "FOR EACH STATEMENT EXECUTE FUNCTION mini_ivm_maintain('%s')",
+        agg_table_name, source_table, agg_table_name);
+    SPI_execute(query.data, false, 0);
+
+    /* 2. Statement-level DELETE trigger with catalog lookup */
+    resetStringInfo(&query);
+    appendStringInfo(&query,
+        "CREATE TRIGGER mini_ivm_trig_del_%s "
+        "AFTER DELETE ON \"%s\" "
+        "REFERENCING OLD TABLE AS old_table "
+        "FOR EACH STATEMENT EXECUTE FUNCTION mini_ivm_maintain('%s')",
+        agg_table_name, source_table, agg_table_name);
+    SPI_execute(query.data, false, 0);
+
+    /* 3. Statement-level UPDATE trigger with catalog lookup */
+    resetStringInfo(&query);
+    appendStringInfo(&query,
+        "CREATE TRIGGER mini_ivm_trig_upd_%s "
+        "AFTER UPDATE ON \"%s\" "
+        "REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table "
+        "FOR EACH STATEMENT EXECUTE FUNCTION mini_ivm_maintain('%s')",
+        agg_table_name, source_table, agg_table_name);
     SPI_execute(query.data, false, 0);
 
     elog(NOTICE, "Incremental MV \"%s\" created (agg table: %s)", mv_name, agg_table_name);
@@ -966,10 +1403,35 @@ drop_incremental_mv(PG_FUNCTION_ARGS)
             "DROP TRIGGER IF EXISTS mini_ivm_trigger_%s ON \"%s\".\"%s\"",
             agg_table_name, mv_schema, mv_name);
         SPI_execute(query.data, false, 0);
+
+        resetStringInfo(&query);
+        appendStringInfo(&query,
+            "DROP TRIGGER IF EXISTS mini_ivm_trig_ins_%s ON \"%s\".\"%s\"",
+            agg_table_name, mv_schema, mv_name);
+        SPI_execute(query.data, false, 0);
+
+        resetStringInfo(&query);
+        appendStringInfo(&query,
+            "DROP TRIGGER IF EXISTS mini_ivm_trig_del_%s ON \"%s\".\"%s\"",
+            agg_table_name, mv_schema, mv_name);
+        SPI_execute(query.data, false, 0);
+
+        resetStringInfo(&query);
+        appendStringInfo(&query,
+            "DROP TRIGGER IF EXISTS mini_ivm_trig_upd_%s ON \"%s\".\"%s\"",
+            agg_table_name, mv_schema, mv_name);
+        SPI_execute(query.data, false, 0);
     }
 
     resetStringInfo(&query);
     appendStringInfo(&query, "DROP TABLE IF EXISTS %s", agg_table_name);
+    SPI_execute(query.data, false, 0);
+
+    /* Delete metadata record from mini_ivm_catalog */
+    resetStringInfo(&query);
+    appendStringInfo(&query,
+        "DELETE FROM mini_ivm_catalog WHERE mv_name = '%s' OR agg_table = '%s'",
+        mv_name, agg_table_name);
     SPI_execute(query.data, false, 0);
 
     elog(NOTICE, "Incremental MV \"%s\" dropped", mv_name);
