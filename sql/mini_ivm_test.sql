@@ -31,11 +31,12 @@ CREATE TABLE orders (
     amount NUMERIC
 );
 
--- Create materialized view with all 4 aggregate types
+-- Create materialized view with all 5 aggregate types
 CREATE MATERIALIZED VIEW order_summary AS
 SELECT product, category,
        SUM(amount) AS total_amount,
        COUNT(*) AS num_orders,
+       AVG(amount) AS avg_amount,
        MIN(amount) AS min_amount,
        MAX(amount) AS max_amount
 FROM orders
@@ -111,8 +112,66 @@ SELECT drop_incremental_mv('sensor_summary');
 DROP MATERIALIZED VIEW sensor_summary;
 DROP TABLE sensor_data;
 
+-- Test Multi-Table JOIN IMMV
+CREATE TABLE categories (
+    cat_id INT PRIMARY KEY,
+    cat_name TEXT
+);
+
+CREATE TABLE items (
+    item_id INT PRIMARY KEY,
+    category_id INT,
+    price NUMERIC
+);
+
+INSERT INTO categories VALUES (1, 'Electronics'), (2, 'Books');
+INSERT INTO items VALUES (101, 1, 500), (102, 1, 300), (103, 2, 50);
+
+CREATE MATERIALIZED VIEW category_sales AS
+SELECT c.cat_name,
+       SUM(i.price) AS total_sales,
+       AVG(i.price) AS avg_price,
+       COUNT(*) AS item_count
+FROM items i JOIN categories c ON i.category_id = c.cat_id
+GROUP BY c.cat_name;
+
+SELECT create_incremental_mv('category_sales');
+SELECT 'JOIN_INITIAL' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+-- Test INSERT into items (base table 1)
+INSERT INTO items VALUES (104, 1, 200);
+SELECT 'JOIN_INSERT_ITEM' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+-- Test INSERT into categories (base table 2) & items
+INSERT INTO categories VALUES (3, 'Clothing');
+INSERT INTO items VALUES (105, 3, 100);
+SELECT 'JOIN_INSERT_CAT' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+-- Test UPDATE item price
+UPDATE items SET price = 600 WHERE item_id = 101;
+SELECT 'JOIN_UPDATE_ITEM' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+-- Test DELETE item
+DELETE FROM items WHERE item_id = 102;
+SELECT 'JOIN_DELETE_ITEM' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+-- Test UPDATE category name
+UPDATE categories SET cat_name = 'Tech & Gadgets' WHERE cat_id = 1;
+SELECT 'JOIN_UPDATE_CAT' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+-- Test DELETE category
+DELETE FROM items WHERE category_id = 2;
+DELETE FROM categories WHERE cat_id = 2;
+SELECT 'JOIN_DELETE_CAT' as test, * FROM imv_category_sales ORDER BY cat_name;
+
+SELECT drop_incremental_mv('category_sales');
+DROP MATERIALIZED VIEW category_sales;
+DROP TABLE items;
+DROP TABLE categories;
+
 -- Cleanup
 SELECT drop_incremental_mv('order_summary');
 DROP MATERIALIZED VIEW order_summary;
 DROP TABLE orders;
+
 
