@@ -1,4 +1,8 @@
-mini_ivm.bc
-mini_ivm.o
-mini_ivm.so
-results/mini_ivm_test.out
+*.o
+*.bc
+*.so
+*.bak
+results/
+regression.diffs
+regression.out
+tmp_check/

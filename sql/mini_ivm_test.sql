@@ -1,22 +1,7 @@
 -- mini_ivm regression test
 
 SET client_min_messages TO warning;
-SET dynamic_library_path TO '/tmp';
-
-CREATE OR REPLACE FUNCTION mini_ivm_maintain()
-RETURNS trigger
-AS '/tmp/mini_ivm', 'mini_ivm_maintain'
-LANGUAGE C;
-
-CREATE OR REPLACE FUNCTION create_incremental_mv(mv_name text)
-RETURNS void
-AS '/tmp/mini_ivm', 'create_incremental_mv'
-LANGUAGE C;
-
-CREATE OR REPLACE FUNCTION drop_incremental_mv(mv_name text)
-RETURNS void
-AS '/tmp/mini_ivm', 'drop_incremental_mv'
-LANGUAGE C;
+CREATE EXTENSION mini_ivm;
 
 -- Cleanup existing leftover objects if any
 DROP TABLE IF EXISTS mini_ivm_catalog CASCADE;
