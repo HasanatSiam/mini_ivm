@@ -1,0 +1,1 @@
+SELECT create_incremental_mv('order_summary');
