@@ -150,3 +150,31 @@ make installcheck
 ```
 
 Test inputs: `sql/mini_ivm_test.sql` · Expected output: `expected/mini_ivm_test.out`
+
+### Testing on a New Machine
+
+If you are setting up a fresh machine to test the extension, you will need the C compiler, `make`, and PostgreSQL development headers:
+
+```bash
+sudo apt update
+sudo apt install build-essential postgresql-server-dev-16 postgresql-16
+```
+*(Adjust `16` to match your target PostgreSQL version).*
+
+Then, clone, build, install, and run tests as normal:
+```bash
+git clone https://github.com/HasanatSiam/mini_ivm.git
+cd mini_ivm
+make
+sudo make install
+make installcheck
+```
+*Note: `sudo make install` must be run on the same physical machine that is hosting the PostgreSQL server, as it copies the compiled binary into Postgres's internal library folders.*
+
+### Testing Against a Remote Database
+
+If you have compiled and installed the extension on a remote server (via `sudo make install`), but want to trigger the test suite from your local machine, you can pass connection arguments to `make installcheck`:
+
+```bash
+make installcheck REGRESS_OPTS="--host=192.168.1.50 --port=5432 --user=postgres"
+```
