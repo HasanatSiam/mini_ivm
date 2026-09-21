@@ -2,14 +2,15 @@
 
 `mini_ivm` is a lightweight **PostgreSQL C Extension** that incrementally maintains materialized views using database triggers. Instead of requiring a full `REFRESH MATERIALIZED VIEW`, it updates the underlying aggregation table on every `INSERT`, `UPDATE`, or `DELETE` on the source table.
 
-Supports **SUM**, **COUNT**, **MIN**, and **MAX** aggregates with automatic AST-based parsing of the materialized view definition.
+Supports **SUM**, **COUNT**, **MIN**, **MAX**, and **AVG** aggregates with automatic AST-based parsing of the materialized view definition, including support for **multi-table JOINs**.
 
 ---
 
 ## Features
 
 - **SQL-based setup:** Create a standard `MATERIALIZED VIEW`, then call `create_incremental_mv('view_name')` — the extension parses the view definition automatically.
-- **SUM, COUNT, MIN, MAX:** Full incremental maintenance for all four aggregate types.
+- **SUM, COUNT, MIN, MAX, AVG:** Full incremental maintenance for all five aggregate types.
+- **Multi-Table JOINs:** Maintain views that join across multiple base tables automatically.
 - **Smart UPDATE handling:** Grouping column changes trigger DELETE+INSERT; value-only changes update aggregates in-place; no-op changes are skipped.
 - **MIN/MAX recomputation:** When the min or max row is deleted, the extension automatically recomputes from the source data.
 - **Garbage collection:** Zero-count rows are pruned automatically.
@@ -70,6 +71,7 @@ SELECT
     category,
     SUM(amount) AS total_amount,
     COUNT(*)    AS num_orders,
+    AVG(amount) AS avg_amount,
     MIN(amount) AS min_amount,
     MAX(amount) AS max_amount
 FROM orders
@@ -88,8 +90,8 @@ This creates an internal tracking table (`imv_order_summary`), backfills it with
 ```sql
 -- Initial state (empty)
 SELECT * FROM imv_order_summary ORDER BY product, category;
---  product | category | total_amount | num_orders | min_amount | max_amount
--- ---------+----------+--------------+------------+------------+------------
+--  product | category | total_amount | num_orders | avg_amount | min_amount | max_amount
+-- ---------+----------+--------------+------------+------------+------------+------------
 -- (0 rows)
 
 -- INSERT
@@ -98,38 +100,38 @@ INSERT INTO orders VALUES ('Laptop', 'Electronics', 1200);
 INSERT INTO orders VALUES ('Phone', 'Electronics', 800);
 
 SELECT * FROM imv_order_summary ORDER BY product, category;
---  product |  category   | total_amount | num_orders | min_amount | max_amount
--- ---------+-------------+--------------+------------+------------+------------
---  Laptop  | Electronics |         2200 |          2 |       1000 |       1200
---  Phone   | Electronics |          800 |          1 |        800 |        800
+--  product |  category   | total_amount | num_orders |      avg_amount      | min_amount | max_amount
+-- ---------+-------------+--------------+------------+----------------------+------------+------------
+--  Laptop  | Electronics |         2200 |          2 | 1100.0000000000000000 |       1000 |       1200
+--  Phone   | Electronics |          800 |          1 |  800.0000000000000000 |        800 |        800
 
 -- UPDATE value column (old MIN=1000 becomes 1500, MIN recomputes)
 UPDATE orders SET amount = 1500 WHERE amount = 1000;
 
 SELECT * FROM imv_order_summary ORDER BY product, category;
---  product |  category   | total_amount | num_orders | min_amount | max_amount
--- ---------+-------------+--------------+------------+------------+------------
---  Laptop  | Electronics |         2700 |          2 |       1200 |       1500
---  Phone   | Electronics |          800 |          1 |        800 |        800
+--  product |  category   | total_amount | num_orders |      avg_amount      | min_amount | max_amount
+-- ---------+-------------+--------------+------------+----------------------+------------+------------
+--  Laptop  | Electronics |         2700 |          2 | 1350.0000000000000000 |       1200 |       1500
+--  Phone   | Electronics |          800 |          1 |  800.0000000000000000 |        800 |        800
 
 -- UPDATE group column (category change — DELETE+INSERT)
 UPDATE orders SET category = 'Office' WHERE amount = 1200;
 
 SELECT * FROM imv_order_summary ORDER BY product, category;
---  product |  category   | total_amount | num_orders | min_amount | max_amount
--- ---------+-------------+--------------+------------+------------+------------
---  Laptop  | Electronics |         1500 |          1 |       1500 |       1500
---  Laptop  | Office      |         1200 |          1 |       1200 |       1200
---  Phone   | Electronics |          800 |          1 |        800 |        800
+--  product |  category   | total_amount | num_orders |      avg_amount      | min_amount | max_amount
+-- ---------+-------------+--------------+------------+----------------------+------------+------------
+--  Laptop  | Electronics |         1500 |          1 | 1500.0000000000000000 |       1500 |       1500
+--  Laptop  | Office      |         1200 |          1 | 1200.0000000000000000 |       1200 |       1200
+--  Phone   | Electronics |          800 |          1 |  800.0000000000000000 |        800 |        800
 
 -- DELETE
 DELETE FROM orders WHERE amount = 800;
 
 SELECT * FROM imv_order_summary ORDER BY product, category;
---  product |  category   | total_amount | num_orders | min_amount | max_amount
--- ---------+-------------+--------------+------------+------------+------------
---  Laptop  | Electronics |         1500 |          1 |       1500 |       1500
---  Laptop  | Office      |         1200 |          1 |       1200 |       1200
+--  product |  category   | total_amount | num_orders |      avg_amount      | min_amount | max_amount
+-- ---------+-------------+--------------+------------+----------------------+------------+------------
+--  Laptop  | Electronics |         1500 |          1 | 1500.0000000000000000 |       1500 |       1500
+--  Laptop  | Office      |         1200 |          1 | 1200.0000000000000000 |       1200 |       1200
 ```
 
 ### 4. Drop incremental tracking
