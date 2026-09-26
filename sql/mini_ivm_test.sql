@@ -2,6 +2,7 @@
 
 SET client_min_messages TO warning;
 CREATE EXTENSION mini_ivm;
+LOAD 'mini_ivm';
 
 -- Cleanup existing leftover objects if any
 DROP TABLE IF EXISTS mini_ivm_catalog CASCADE;
@@ -26,9 +27,6 @@ SELECT product, category,
        MAX(amount) AS max_amount
 FROM orders
 GROUP BY product, category;
-
--- Create the incremental materialized view
-SELECT create_incremental_mv('order_summary');
 
 -- Check initial state (empty)
 SELECT * FROM imv_order_summary ORDER BY product, category;
@@ -81,8 +79,6 @@ SELECT device_id, recorded_at,
 FROM sensor_data
 GROUP BY device_id, recorded_at;
 
-SELECT create_incremental_mv('sensor_summary');
-
 INSERT INTO sensor_data VALUES (1, '2026-01-01 10:00:00', 42.5);
 INSERT INTO sensor_data VALUES (1, '2026-01-01 10:00:00', 10.0);
 SELECT 'TYPES_INSERT' as test, * FROM imv_sensor_summary ORDER BY device_id, recorded_at;
@@ -93,7 +89,6 @@ SELECT 'TYPES_UPDATE' as test, * FROM imv_sensor_summary ORDER BY device_id, rec
 DELETE FROM sensor_data WHERE reading = 50.0;
 SELECT 'TYPES_DELETE' as test, * FROM imv_sensor_summary ORDER BY device_id, recorded_at;
 
-SELECT drop_incremental_mv('sensor_summary');
 DROP MATERIALIZED VIEW sensor_summary;
 DROP TABLE sensor_data;
 
@@ -120,7 +115,6 @@ SELECT c.cat_name,
 FROM items i JOIN categories c ON i.category_id = c.cat_id
 GROUP BY c.cat_name;
 
-SELECT create_incremental_mv('category_sales');
 SELECT 'JOIN_INITIAL' as test, * FROM imv_category_sales ORDER BY cat_name;
 
 -- Test INSERT into items (base table 1)
@@ -149,13 +143,11 @@ DELETE FROM items WHERE category_id = 2;
 DELETE FROM categories WHERE cat_id = 2;
 SELECT 'JOIN_DELETE_CAT' as test, * FROM imv_category_sales ORDER BY cat_name;
 
-SELECT drop_incremental_mv('category_sales');
 DROP MATERIALIZED VIEW category_sales;
 DROP TABLE items;
 DROP TABLE categories;
 
 -- Cleanup
-SELECT drop_incremental_mv('order_summary');
 DROP MATERIALIZED VIEW order_summary;
 DROP TABLE orders;
 
