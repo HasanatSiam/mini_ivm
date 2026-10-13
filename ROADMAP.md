@@ -47,7 +47,7 @@ Real IVM extensions like `pg_ivm` don't require users to pass comma-separated co
 **Action Items for `mini_ivm`:**
 - [x] **Parse the Query Tree:** Analyze the `SELECT` query tree to automatically determine base table(s), grouping columns, and aggregate functions.
 - [x] **Catalog Metadata Storage:** Create an internal catalog table (e.g., `mini_ivm_catalog`) to store parsed view definitions, base table mappings, and grouping column metadata instead of encoding them into trigger argument strings.
-- [ ] **Hook `ProcessUtility`:** Intercept SQL commands like `CREATE INCREMENTAL MATERIALIZED VIEW` or custom DDL syntax to automate IMMV creation transparently.
+- [x] **Hook `ProcessUtility`:** *Decision: Abandoned.* Intercepting `CREATE INCREMENTAL...` fails because the core Postgres parser rejects unknown keywords before the hook fires. We will use a standard setup function like `pg_ivm` instead.
 
 ---
 
