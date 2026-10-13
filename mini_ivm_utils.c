@@ -12,6 +12,8 @@
 
 #include "mini_ivm.h"
 
+PG_MODULE_MAGIC;
+
 /*
  * datum_equal - compare two Datums of a given type, NULL-aware.
  */
